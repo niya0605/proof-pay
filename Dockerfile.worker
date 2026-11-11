@@ -1,0 +1,14 @@
+# Official Playwright image, version pinned to the worker's playwright dependency.
+FROM mcr.microsoft.com/playwright:v1.65.0-noble
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY api/package.json api/
+COPY worker/package.json worker/
+COPY web/package.json web/
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 NODE_ENV=production
+RUN npm ci -w worker --include-workspace-root=false
+COPY worker worker
+USER pwuser
+EXPOSE 3002
+# Only WORKER_JOB_SECRET and ALLOWED_HOSTS are passed in: no PayPal or LLM keys.
+CMD ["npx", "-w", "worker", "tsx", "src/server.ts"]

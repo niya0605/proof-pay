@@ -1,0 +1,523 @@
+PROOF-PAY: PROJECT ANALYSIS
+===========================
+State of the code in /Users/niya/PROOF PAY as of 11 Nov 2026. Every statement below is
+taken from the source files, the test suite, or test runs performed during development.
+Items that are NOT verified are listed as such in section 14.
+
+
+1. WHAT IT IS
+-------------
+Proof-Pay is a web app for freelance website work.
+
+  1. A client writes a vague brief.
+  2. An AI step asks clarifying questions and then proposes measurable acceptance checks.
+     The checks may only use a fixed catalog of five types.
+  3. Client and freelancer both approve. The agreement is then locked and SHA-256 hashed.
+  4. The client authorizes the payment through PayPal (intent AUTHORIZE). This is an
+     authorization, not escrow.
+  5. The freelancer submits a URL. A sandboxed Playwright worker tests it, and an AI
+     acceptance agent drives the contact-form check.
+  6. A deterministic evaluator decides pass or fail.
+  7. Failures go to an AI "fix coach" that explains them.
+  8. When every check passes, the client clicks Accept and the backend captures the payment.
+  9. The report shows the status PayPal confirmed.
+
+Design rule, from the README: "AI writes, explores and explains. Deterministic code decides
+what passed and what gets paid."
+
+Scope: website deliverables only. PayPal sandbox only.
+
+
+2. REPOSITORY LAYOUT
+--------------------
+npm workspaces: api, worker, web. TypeScript is run directly with tsx (there is no build step
+for api or worker).
+
+  api/src            2,561 lines   Express backend
+  api/test             848 lines   Vitest tests
+  worker/src           481 lines   Playwright verifier service
+  web/src            1,384 lines   React frontend
+  demo-sites           155 lines   broken/ and fixed/ demo deliverables, plus a static server
+  scripts/e2e-api.mjs              Full loop over HTTP against running services
+  Dockerfile.api, Dockerfile.worker, docker-compose.yml
+  README.md, LICENSE (MIT), .env.example, .gitignore
+
+Ports in development:
+  api           3001
+  worker        3002
+  web (Vite)    5173  proxies /api and /artifacts to 3001
+  demo sites    5174
+
+Root scripts:
+  dev         Runs api, worker, web and demo sites together (concurrently).
+  seed        Inserts a sample project.
+  demo        seed, then dev.
+  test        Runs the api's vitest suite.
+  typecheck   Type-checks api, worker and web.
+  test:e2e    Runs worker test/demoSites.e2e.ts. THAT FILE DOES NOT EXIST (see section 14).
+
+
+3. TECH STACK (versions from package.json)
+------------------------------------------
+api:
+  express ^5.3.0, better-sqlite3 ^13.0.3, zod ^4.6.7
+  dev: typescript ^7.0.2, tsx ^4.23.15, vitest ^5.1.0
+
+worker:
+  express ^5.3.0, playwright 1.65.0 (pinned), ipaddr.js ^2.5.0
+
+web:
+  react ^19.3.1, react-dom ^19.3.1, react-router-dom ^7.18.5, @paypal/react-paypal-js ^10.6.1
+  dev: vite ^8.3.7, tailwindcss ^4.3.5 with @tailwindcss/vite
+
+Fonts: Geist and Geist Mono, loaded from Google Fonts in web/index.html.
+
+LLM:
+  - Default: Google Gemini, called over fetch through the Interactions API
+    (POST /v1beta/interactions).
+  - LLM_GEMINI_API=generatecontent switches to the generateContent API.
+  - LLM_PROVIDER=anthropic switches to the Anthropic Messages API.
+
+Database: SQLite in WAL mode, file data/proofpay.db (set by DB_FILE).
+
+
+4. ARCHITECTURE
+---------------
+Browser (React)
+  └─ Express API (api/src)
+       ├─ milestoneService.transition()  The only way to change state.
+       ├─ agreementService               Canonical JSON, SHA-256, version-checked approvals.
+       ├─ paymentService → paypal.ts     The only module that calls PayPal.
+       ├─ AI engine (ai/engine.ts)       Brief workflow, fix coach, acceptance-agent steps.
+       ├─ verificationService            Sends jobs to the worker, then runs the evaluator.
+       └─ jobs/loop.ts                   Background ticks.
+  └─ Worker (worker/src)
+       ├─ Holds no PayPal or LLM keys. It receives a job and a per-run job token.
+       ├─ For each agent step it asks the API at /internal/agent/step.
+       └─ The demo site's form posts to the API's public /inbox/:token.
+
+Background jobs (jobs/loop.ts):
+  - On startup: recoverStaleRuns(), then reconcile().
+  - Every 1 s: processQueue(). It runs one verification at a time.
+  - Every 60 s: reconcile({ minAgeMs: 30000 }), reauthorizeJob, deadlinesJob.
+
+
+5. DATA MODEL (api/src/db/schema.sql)
+-------------------------------------
+Ten tables:
+
+  projects            id, title, brief, client_id, freelancer_id, freelancer_email, created_at
+  milestones          id, project_id, title, amount_cents, currency, state, deadline_at,
+                      review_window_hours, inbox_token (UNIQUE)
+  agreements          milestone_id, version, body_json, hash, client_approved_at,
+                      freelancer_approved_at, locked_at
+  authorizations      id, milestone_id, order_id, status, expires_at, replaced_by, created_at
+  payment_operations  id, milestone_id, type, idempotency_key (UNIQUE), status,
+                      requested_at, responded_at, paypal_ref, error, target_ref
+                        type: create_order | authorize | reauthorize | capture | void
+                        status: PENDING | SUCCEEDED | FAILED | UNKNOWN
+  submissions         id, milestone_id, url, submitted_at
+  verification_runs   id, submission_id, status (running | finished | error),
+                      runner_version, started_at, finished_at, error
+  check_results       id, run_id, check_id, status (passed | failed | error), expected_json,
+                      measured_json, evidence_json, explanation, agent_json
+  events              id, milestone_id, at, actor, type, data_json
+  form_inbox          id, inbox_token, run_id, received_at, body_json
+
+Triggers events_no_update and events_no_delete RAISE(ABORT): events is append-only.
+
+Columns added beyond the original spec: payment_operations.target_ref,
+verification_runs.error, check_results.agent_json.
+
+
+6. STATE MACHINE (api/src/domain/milestoneState.ts)
+---------------------------------------------------
+There are 14 states:
+  DRAFT, PROPOSED, LOCKED, FUNDED, VERIFYING, FAILED, REVIEW, DISPUTE, CAPTURE_PENDING,
+  CAPTURED, CAPTURE_FAILED, AUTH_EXPIRED, VOID_PENDING, VOIDED.
+
+Transitions, listed as event: from → to (allowed actors):
+
+  PROPOSAL_READY          DRAFT, PROPOSED → PROPOSED (system)
+  CRITERION_EDITED        PROPOSED → PROPOSED (client, freelancer)
+  LOCK                    PROPOSED → LOCKED (client, freelancer)
+  AUTHORIZED              LOCKED → FUNDED
+                          CAPTURE_FAILED → CAPTURE_PENDING
+                          AUTH_EXPIRED → REVIEW if a passing run exists, otherwise FUNDED
+                          (payment)
+  SUBMIT                  FUNDED, FAILED → VERIFYING (freelancer)
+  RUN_FAILED              VERIFYING → FAILED (verification)
+  RUN_PASSED              VERIFYING → REVIEW (verification)
+  RUN_ERROR               VERIFYING → FAILED if the previous finished run failed,
+                          otherwise FUNDED (verification)
+  ACCEPT                  REVIEW → CAPTURE_PENDING (client)
+  REJECT                  REVIEW → DISPUTE (client)
+  RESOLVE_FOR_FREELANCER  DISPUTE → CAPTURE_PENDING (admin)
+  RESOLVE_FOR_CLIENT      DISPUTE → VOID_PENDING (admin)
+  CANCEL                  FUNDED, FAILED → VOID_PENDING (client)
+  DEADLINE_PASSED         FUNDED, FAILED → VOID_PENDING (job)
+  AUTH_EXPIRED            FUNDED, FAILED, REVIEW, DISPUTE → AUTH_EXPIRED (payment)
+  CAPTURE_COMPLETED       CAPTURE_PENDING → CAPTURED (payment)
+  CAPTURE_DECLINED        CAPTURE_PENDING → CAPTURE_FAILED (payment)
+  ADMIN_CLOSE             CAPTURE_FAILED, AUTH_EXPIRED → VOID_PENDING if a live
+                          authorization exists, otherwise VOIDED (admin)
+  VOID_CONFIRMED          VOID_PENDING → VOIDED (payment)
+
+transition(id, event, actor, {ctx, effect, data}) works in this order, inside one
+IMMEDIATE SQLite transaction:
+  1. Check the actor (wrong actor: 403).
+  2. Check the from-state (wrong state: 409).
+  3. Run UPDATE ... WHERE id=? AND state=? and require changes === 1 (compare-and-set).
+  4. Run the effect.
+  5. Log the event.
+
+
+7. AGREEMENT AND HASH (services/agreementService.ts)
+----------------------------------------------------
+Agreement body:
+  milestoneId, checks, manual, advisory, amount {value, currency}, payee {email},
+  deadlineAt, reviewRule.
+
+Hash: the body is serialized as canonical JSON (keys sorted recursively), and the hash is the
+SHA-256 of that string.
+
+  - Editing the agreement (version-checked) clears both approvals.
+  - Approve requires the approver's version to match the current version.
+  - The second approval runs LOCK, stores the hash, and queues the PayPal create_order
+    operation in the same transaction.
+  - verifiedLockedAgreement() recomputes the hash and compares it with the stored one before
+    it is used.
+
+
+8. CHECK CATALOG AND EVALUATOR (api/src/checks)
+-----------------------------------------------
+There are five check types (strict Zod discriminated union):
+
+  viewport_render    {width: int 240..2560}
+                     Passes if the page loaded and scrollWidth <= clientWidth.
+  element_present    {role: one of 12 ARIA roles, name}
+                     Passes if the element is visible.
+  text_present       {text}
+                     Passes if the text was found.
+  form_submits       {fields: 1..8 names}
+                     Passes only if an inbox row received between submittedAt − 1 s and
+                     submittedAt + 10 s contains every field with its exact test value.
+  no_console_errors  {allowList: string[]}
+                     Passes if no errors remain after the allow-list filter.
+
+Proposal limits: checks 1–12, manual criteria up to 6, advisory notes up to 6. Ids must be
+unique.
+
+Fixed test values:
+  name     "Test User"
+  email    "test@proofpay.dev"
+  message  "Proof-Pay test message"
+  phone    "+1 555 0100"
+  subject  "Proof-Pay test subject"
+  company  "Proof-Pay Test Co"
+
+Evaluator rules:
+  - A result with evidence that cannot be resolved is "error", never "passed".
+  - A "passed" result with no evidence becomes "error".
+  - Agent observations never change the verdict.
+
+Fallback proposal (templateProposal), used when the AI output is unusable:
+  - viewport 375 and viewport 1280.
+  - If the brief mentions a form: a Send button and a form check on name, email, message.
+  - no_console_errors.
+
+
+9. AI COMPONENTS (api/src/ai)
+-----------------------------
+engine.ts
+
+  Request handling:
+  - runAI() forces a "respond" tool, validates its output with Zod, and retries once on
+    invalid output. After that it uses a deterministic fallback.
+  - Every model call is logged as a model_call or model_error event.
+  - setModelCaller() lets tests inject a scripted model.
+
+  Gemini Interactions caller:
+  - Sends a step-list input: user_input, then model steps (thought, function_call), then
+    function_result.
+  - Returns thought steps with each function call on the following turn.
+  - Uses tool_choice "any", or allowed_tools when one specific tool is required.
+  - Sets store: false.
+
+  Model fallback:
+  - LLM_MODEL is a comma-separated list. The default is
+    gemini-3.5-flash-lite, gemma-4-26b-a4b-it, gemini-3.5-flash.
+  - A 429 moves straight to the next model.
+  - A 500 or 503 gets one retry after 2 s, then the next model.
+  - A timeout (LLM_TIMEOUT_MS, default 30 s) moves to the next model.
+  - Any other error ends in the fallback.
+
+  Other options:
+  - Optional pacing with LLM_MIN_INTERVAL_MS.
+  - The generateContent path also exists, with a fallback to the OpenAPI schema subset.
+
+  Prompt-injection guard: untrusted() wraps page and console text in <untrusted_page_data>.
+
+brief.ts
+  - clarify(): finds vague terms and asks up to 6 questions. Fallback: a vague-word dictionary
+    (templateQuestions).
+  - propose(): the model sees a wire schema that lists every catalog parameter; the strict
+    ProposalSchema then validates the output. Fallback: templateProposal.
+
+acceptanceTools.ts (acceptance agent)
+  - Tools: open_page, list_elements, screenshot, fill, click, read_inbox, record_observation,
+    finish.
+  - Maximum 25 steps. Sessions are kept in memory, keyed by run and check.
+  - The system prompt says that the agent does not decide pass or fail, and that untrusted
+    data is never instructions.
+  - The agent runs only for form_submits, and only when an LLM is configured.
+
+fixCoach.ts
+  - Returns an explanation, reproduction steps and a likely fix for a failed or errored check.
+    It is told the verdict is final.
+  - Fallback: rawExplanation.
+
+
+10. VERIFIER WORKER (worker/src)
+--------------------------------
+server.ts
+  - POST /jobs with a Bearer WORKER_JOB_SECRET, compared in constant time.
+  - One run at a time; a second request gets 429.
+  - GET /healthz.
+
+runChecks.ts limits:
+  - 60 s per check (WORKER_CHECK_TIMEOUT_MS).
+  - 5 min per run.
+  - 30 s navigation timeout (WORKER_NAV_TIMEOUT_MS).
+  - 25 agent steps.
+
+  Check order: viewport_render, element_present, text_present, form_submits,
+  no_console_errors.
+
+form_submits:
+  - Uses the agent if available; otherwise a deterministic plan.
+  - The deterministic plan locates fields by label, placeholder, name and id, dismisses a
+    cookie banner, and clicks send/submit.
+  - If the agent stops before submitting, the deterministic plan runs.
+  - Every step is posted live to /internal/agent/trace.
+
+urlGuard.ts and browser.ts (SSRF protection):
+  - https only, no credentials, port 443 only, exact punycode host match against
+    ALLOWED_HOSTS.
+  - DNS: the worker resolves the host itself and accepts only ipaddr.js range() "unicast".
+    That rejects loopback, RFC1918, link-local / 169.254.169.254, CGNAT, multicast,
+    fc00::/7 and v4-mapped forms.
+  - Chromium runs with --host-resolver-rules "MAP host ip, MAP * ~NOTFOUND", which pins DNS.
+  - context.route() re-checks every request against the target and inbox origins, and
+    redirect hops are checked with redirectedFrom(). Anything else is aborted, and the run
+    ends as error.
+  - DEV_LOCAL_ORIGINS: exact local origins that bypass https / 443 / private-IP rules.
+    Development only.
+
+Verification flow (verificationService.ts):
+  1. Create a run with runner_version "proofpay-runner/1 playwright@1.65.0" and a job token.
+  2. POST the job to WORKER_URL/jobs.
+  3. Write artifacts and console.json to artifacts/<runId>/. File names must match
+     ^[a-z0-9][a-z0-9._-]*$.
+  4. Poll the inbox for up to 10 s.
+  5. Evaluate each check and run the fix coach on failures.
+  6. Transition: any failure → RUN_FAILED; all passed → RUN_PASSED; errors with no failures
+     → RUN_ERROR.
+  - Runs left "running" when the backend restarts are finished as error on startup.
+
+
+11. PAYMENTS (services/paypal.ts, services/paymentService.ts)
+-------------------------------------------------------------
+PayPal APIs used:
+  Orders v2   create (intent AUTHORIZE), get, authorize
+  Payments v2 capture (final_capture), void, reauthorize
+  JS SDK      @paypal/react-paypal-js with intent "authorize"
+
+The order carries:
+  custom_id   the agreement hash
+  invoice_id  the milestone id, plus "-<attempt>" from the second attempt
+  payee       payee email, only in PAYPAL_PAYEE_MODE=override
+  payer       payer email, only when PAYPAL_PREFILL_BUYER_EMAIL is set (demo pre-fill)
+
+Idempotency:
+  - Every operation has a key <milestoneId>:<type>:<attempt>, sent as PayPal-Request-Id.
+  - beginOp() reuses an open PENDING or UNKNOWN operation for the same target. An in-memory
+    in-flight set prevents running the same operation twice.
+  - A 4xx is definitive. Timeouts, network errors and 5xx leave the operation UNKNOWN.
+
+ensureOrder():
+  - Reuses the last order unless it is already authorized, or PayPal definitively reports it
+    gone (404) or VOIDED. In that case it creates a new order with the next attempt number.
+    This handles unapproved orders that PayPal deletes after a few hours.
+
+Capture:
+  - Allowed only in CAPTURE_PENDING, which is reached through Accept or an admin ruling for
+    the freelancer.
+  - First GET order: an existing capture is recorded instead of capturing again.
+  - Then the pre-capture check: amount, currency, custom_id == hash, and the payee email when
+    PayPal reports one (both modes).
+  - COMPLETED → CAPTURED. DECLINED or a mismatch → CAPTURE_FAILED. Timeout → UNKNOWN.
+
+Void:
+  - Confirmed through GET order: VOIDED or EXPIRED → VOIDED.
+
+Reconciler:
+  - Runs on startup and every minute (for operations older than 30 s).
+  - Uses GET order to record an existing capture or void. If PayPal shows none, it retries
+    with the same key, never a new one.
+
+Reauthorization (reauthorizeDue):
+  - An authorization that has expired → AUTH_EXPIRED.
+  - After the 3-day honor period, one reauthorize attempt per original authorization.
+    Failure → AUTH_EXPIRED.
+
+Deadlines job: FUNDED or FAILED milestones past deadline_at → DEADLINE_PASSED → void.
+
+Fake PayPal (dev/fakePaypal.ts, FAKE_PAYPAL=1):
+  - An in-process stand-in that honours PayPal-Request-Id.
+  - Failure knobs for capture, void and reauthorize (decline, timeout, server error).
+  - Helpers: approve, tamper, expire.
+  - Used by the tests.
+
+
+12. HTTP API (api/src/routes)
+-----------------------------
+Auth (/api/auth):
+  - POST login, POST logout, GET me.
+  - Three fixed demo users, kept in server-side sessions (cookie pp_sid):
+      client      Dana
+      freelancer  Ravi
+      admin
+  - Optional DEMO_LOGIN_CODE.
+
+/api:
+  GET   /config
+  POST  /projects                     client; deadlineDays max 25
+  GET   /milestones, /milestones/:id  any logged-in role
+  POST  /milestones/:id/clarify       client
+  POST  /milestones/:id/propose       client
+  PATCH /milestones/:id/agreement     client, freelancer
+  POST  /milestones/:id/approve       client, freelancer
+  POST  /milestones/:id/paypal-order  client
+  POST  /milestones/:id/authorize     client
+  POST  /milestones/:id/submit        freelancer
+  POST  /milestones/:id/accept        client
+  POST  /milestones/:id/reject        client; must cite a manual criterion; attachment is a
+                                      note or an inline image
+  POST  /milestones/:id/resolve       admin; {for: freelancer | client}
+  POST  /milestones/:id/cancel        client
+  POST  /milestones/:id/close         admin
+  POST  /admin/reconcile              admin
+
+Public:
+  POST /inbox/:token  CORS open. Accepted only while a verification run is in progress, and
+                      at most 25 rows per run.
+
+Internal (job token required):
+  /internal/agent/start, /agent/step, /agent/end, /agent/trace, GET /internal/inbox
+
+Other:
+  /artifacts  requires a login
+  /healthz
+  The built web app (web/dist) is served with an SPA fallback.
+
+
+13. SECURITY MEASURES IN THE CODE
+---------------------------------
+- Roles come only from the server-side session. Session ids must be 48 hex characters.
+  Sessions expire after 12 h.
+- Cookie: HttpOnly, SameSite=Lax, Max-Age. Secure is added when PUBLIC_BASE_URL is https.
+- Headers on every response:
+  - CSP with a per-request nonce. PayPal origins are allowed; the nonce is passed to the
+    PayPal SDK through <meta name="csp-nonce">.
+  - frame-ancestors 'none', X-Frame-Options DENY, nosniff, Referrer-Policy,
+    Permissions-Policy, COOP same-origin-allow-popups.
+  - HSTS on https.
+  - x-powered-by is disabled.
+- Rate limits (in memory):
+  - login: 20 per minute per IP
+  - clarify, propose and submit: 12 per minute per session
+  - TRUST_PROXY sets Express "trust proxy".
+- Job tokens are compared with timingSafeEqual.
+- Reject screenshots must match data:image/(png|jpeg|webp|gif);base64.
+- SQL uses prepared statements. The one interpolated column name is chosen from two fixed
+  values.
+- The API container runs as the "node" user; the worker container runs as "pwuser".
+- docker-compose gives the worker only WORKER_JOB_SECRET and ALLOWED_HOSTS, and does not
+  publish its port.
+- npm audit: 0 vulnerabilities (at the last run).
+
+
+14. KNOWN GAPS AND LIMITATIONS
+-----------------------------
+- Root "npm run test:e2e" points to worker/test/demoSites.e2e.ts, which does not exist.
+  The working end-to-end script is scripts/e2e-api.mjs.
+- Reauthorization has only been tested against the fake PayPal. It needs an authorization
+  older than 3 days.
+- Dockerfile.api, Dockerfile.worker and docker-compose.yml have never been built (Docker is
+  not installed on the development machine).
+- Network egress restriction for the worker must be enforced by the host (firewall or egress
+  proxy). Compose cannot do it.
+- Authorization is role-based only. Any client, freelancer or admin session can list and open
+  all milestones, because there are three fixed demo users and no per-object ownership check.
+- Sessions, agent sessions, rate-limit counters and the in-flight set are kept in memory in a
+  single process. A restart logs everyone out.
+- Gemini free-tier quotas are per model and per day. The fallback order and the
+  deterministic plans keep runs working when quota runs out.
+- DEV_LOCAL_ORIGINS and PAYPAL_PREFILL_BUYER_EMAIL are for development and demos only, and
+  must be cleared for a public deployment.
+- Nothing has been committed to git yet. The repository is initialized.
+
+
+15. WHAT HAS BEEN VERIFIED
+--------------------------
+Automated:
+  - npm run typecheck: clean for api, worker and web.
+  - npm test: 54 tests in 5 files, all passing.
+    evaluator.test.ts   8   inbox matching, the 10 s window, evidence rules, URL guard
+                            and DNS checks
+    gemini.test.ts      11  both Gemini adapters against a local fake server
+    payment.test.ts     17  duplicate and concurrent Accept, capture timeout plus
+                            reconciliation, crash recovery, void timeout, mismatches,
+                            decline, expiry, reauthorization failure, concurrent approve
+                            and edit, append-only events, expired-order replacement
+    security.test.ts    8   headers and nonce, cookie flags, session-only roles,
+                            artifacts auth, inbox gating, image validation, login rate limit
+    verifier.test.ts    10  real Chromium against demo sites: broken fails and fixed
+                            passes; agent trace; narration override dropped; prompt
+                            injection; redirect blocking; timeout = error; fixed site
+                            10/10; AI retry and fallback; out-of-catalog rejected
+
+Manual, against the real PayPal sandbox and real Gemini (11 Nov 2026):
+  - Full loop through the API (scripts/e2e-api.mjs): broken site FAILED (message missing,
+    fix coach explained it); fixed site REVIEW; Accept → CAPTURED. PayPal reported capture
+    0LV469105E656490K as COMPLETED, with custom_id equal to the agreement hash.
+  - Full loop through the web UI with the real PayPal popup: capture 8F140970LY2475842,
+    COMPLETED.
+  - Void: authorization VOIDED, confirmed through GET order. A repeat void with the same
+    key succeeded without a duplicate.
+  - The PayPal button and popup work under the production CSP, the buyer email is
+    pre-filled, and the milestone reached FUNDED with no CSP violations.
+
+Sandbox setup facts found during testing:
+  - An India (IN) sandbox buyer cannot pay an IN seller. The buyer used is a US personal
+    sandbox account.
+  - The REST app belongs to the IN business account. With the payee override pointing at a
+    different account, capture worked but void returned 403 PERMISSION_DENIED. The .env
+    therefore uses PAYPAL_PAYEE_MODE=self, with the app owner's account as payee.
+  - The Gemini key type used (AQ.*) works only through the Interactions API.
+
+
+16. HOW TO RUN
+--------------
+  npm install
+  npx -w worker playwright install chromium
+  cp .env.example .env       then fill in the PayPal sandbox and Gemini values,
+                             or set FAKE_PAYPAL=1
+  npm run demo               API :3001, worker :3002, web :5173, demo sites :5174
+  open http://localhost:5173
+
+Tests:
+  npm test
+  npm run typecheck
+  node --env-file=.env scripts/e2e-api.mjs   with the services running

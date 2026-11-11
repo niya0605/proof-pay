@@ -1,0 +1,38 @@
+# Dependencies and build output
+node_modules/
+dist/
+web/dist/
+*.tsbuildinfo
+
+# Secrets: never commit. Only .env.example (no values) is tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.crt
+
+# Runtime data: SQLite database, evidence screenshots and traces
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+artifacts/*
+!artifacts/.gitkeep
+
+# Test and debug output
+coverage/
+test-results/
+playwright-report/
+sandbox-approve-error.png
+scripts/.*-tmp.mjs
+worker/.*-tmp.mjs
+
+# Logs and OS/editor files
+*.log
+npm-debug.log*
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,21 @@
+{
+  "name": "proof-pay",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "api",
+    "worker",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,worker,web,sites -c blue,magenta,green,yellow \"npm -w api run dev\" \"npm -w worker run dev\" \"npm -w web run dev\" \"node demo-sites/serve.mjs\"",
+    "seed": "npm -w api run seed",
+    "demo": "npm run seed && npm run dev",
+    "test": "npm -w api test",
+    "test:e2e": "npm -w worker run test:e2e",
+    "typecheck": "npm -w api run typecheck && npm -w worker run typecheck && npm -w web run typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

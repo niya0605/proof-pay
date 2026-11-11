@@ -1,0 +1,22 @@
+# Backend and verifier worker as separate containers. The worker has no secrets except
+# its job token, no database volume, and is not published to the host.
+# NOTE: Compose alone cannot restrict the worker's egress to the allowlisted hosts. Do that
+# with a host firewall / egress proxy; inside the worker, resolver pinning and per-request
+# route checks still apply (see README "Verifier safety").
+services:
+  api:
+    build: { context: ., dockerfile: Dockerfile.api }
+    env_file: .env
+    environment:
+      WORKER_URL: http://worker:3002
+      API_INTERNAL_URL: http://api:3001
+    ports: ["3001:3001"]
+    volumes: ["proofpay-data:/data"]
+  worker:
+    build: { context: ., dockerfile: Dockerfile.worker }
+    environment:
+      WORKER_JOB_SECRET: ${WORKER_JOB_SECRET}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+    expose: ["3002"]
+volumes:
+  proofpay-data:
