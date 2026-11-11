@@ -13,7 +13,7 @@ const port = Number(process.env.PORT ?? 3001);
 const fake = process.env.FAKE_PAYPAL === "1" ? createFakePayPal() : undefined;
 if (fake) process.env.PAYPAL_BASE = `http://localhost:${port}/fake-paypal`;
 const app = createApp({ fakePaypal: fake });
-app.listen(port, () => {
+app.listen(port, "0.0.0.0", () => {
   console.log(`Proof-Pay API on :${port}  PayPal: ${fake ? "FAKE (local stand-in)" : process.env.PAYPAL_BASE ?? "sandbox"}  LLM: ${process.env.LLM_API_KEY ? `${provider()} ${modelName()}` : "off (deterministic fallbacks)"}`);
   void startJobs();
 });
