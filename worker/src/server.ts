@@ -26,5 +26,5 @@ app.post("/jobs", async (req, res) => {
   }
 });
 app.get("/healthz", (_req, res) => void res.json({ ok: true, busy }));
-const port = Number(process.env.WORKER_PORT ?? 3002);
+const port = Number(process.env.PORT ?? process.env.WORKER_PORT ?? 3002);
 app.listen(port, () => console.log(`Proof-Pay worker on :${port}`));
