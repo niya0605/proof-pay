@@ -13,7 +13,7 @@ import Timeline from "../components/Timeline.tsx";
 export function useMilestone(id: string) {
   const [d, setD] = useState<Detail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const load = useCallback(() => api<Detail>("GET", `/api/milestones/${id}`).then(setD).catch((e) => setError(e.message)), [id]);
+  const load = useCallback(() => api<Detail>("GET", `/api/milestones/${id}`).then((x) => { setD(x); setError(null); }).catch((e) => setError(e.message)), [id]);
   useEffect(() => {
     load();
     const t = setInterval(load, 1500);

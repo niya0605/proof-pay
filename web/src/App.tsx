@@ -15,10 +15,13 @@ const ROLES: { role: Role; label: string; person: string; initials: string; blur
 
 function useSwitchRole() {
   const { login } = useSession();
+  // Reload after a role switch so every page refetches with the new session
+  // (polls sent during the switch would otherwise show a stale "log in first").
+  const done = () => window.location.reload();
   return (r: Role) =>
-    login(r, localStorage.getItem("pp_code") ?? undefined).catch((e) => {
+    login(r, localStorage.getItem("pp_code") ?? undefined).then(done).catch((e) => {
       const code = prompt(`${e.message}. Demo access code:`);
-      if (code) { localStorage.setItem("pp_code", code); login(r, code); }
+      if (code) { localStorage.setItem("pp_code", code); login(r, code).then(done).catch((err) => alert(err.message)); }
     });
 }
 
