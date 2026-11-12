@@ -1,0 +1,79 @@
+# Render Blueprint: Dashboard -> New -> Blueprint -> pick this repo.
+# Three services: the API (also serves the web app), the Playwright worker, and the demo sites.
+# Values marked sync: false are secrets; Render asks for them when the Blueprint is created.
+# If Render gives a service a different URL (name already taken), update the *_URL, ALLOWED_HOSTS
+# and DEMO_SITE_URLS values below to match.
+services:
+  - type: web
+    name: proof-pay-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm -w web run build
+    # NODE_ENV is set only at start: the build needs devDependencies (vite, tsx).
+    startCommand: NODE_ENV=production npm -w api start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: PAYPAL_BASE
+        value: https://api-m.sandbox.paypal.com
+      - key: PAYPAL_PAYEE_MODE
+        value: self
+      - key: FAKE_PAYPAL
+        value: "0"
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_PAYEE_EMAIL
+        sync: false
+      - key: PAYPAL_PREFILL_BUYER_EMAIL
+        sync: false
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_MODEL
+        value: gemini-3.5-flash-lite,gemma-4-26b-a4b-it,gemini-3.5-flash
+      - key: LLM_API_KEY
+        sync: false
+      - key: DEMO_LOGIN_CODE
+        sync: false
+      - key: WORKER_JOB_SECRET
+        generateValue: true
+      - key: WORKER_URL
+        value: https://proof-pay-worker.onrender.com
+      - key: PUBLIC_BASE_URL
+        value: https://proof-pay-api.onrender.com
+      - key: API_INTERNAL_URL
+        value: https://proof-pay-api.onrender.com
+      - key: ALLOWED_HOSTS
+        value: proof-pay-demos.onrender.com
+      - key: DEMO_SITE_URLS
+        value: https://proof-pay-demos.onrender.com/broken/,https://proof-pay-demos.onrender.com/fixed/
+      - key: TRUST_PROXY
+        value: "1"
+
+  # The worker gets no PayPal or LLM keys: only its job secret and the allowlist.
+  # Docker, so Chromium's system libraries come from the official Playwright image.
+  - type: web
+    name: proof-pay-worker
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.worker
+    healthCheckPath: /healthz
+    envVars:
+      - key: WORKER_PORT
+        value: "10000"
+      - key: WORKER_JOB_SECRET
+        fromService:
+          type: web
+          name: proof-pay-api
+          envVarKey: WORKER_JOB_SECRET
+      - key: ALLOWED_HOSTS
+        value: proof-pay-demos.onrender.com
+
+  # The two demo deliverables: /broken/ and /fixed/.
+  - type: web
+    name: proof-pay-demos
+    runtime: static
+    buildCommand: echo "static demo sites"
+    staticPublishPath: demo-sites

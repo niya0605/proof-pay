@@ -5,8 +5,10 @@ COPY package.json package-lock.json ./
 COPY api/package.json api/
 COPY worker/package.json worker/
 COPY web/package.json web/
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 NODE_ENV=production
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# Install before setting NODE_ENV=production: tsx (used by CMD) is a devDependency.
 RUN npm ci -w worker --include-workspace-root=false
+ENV NODE_ENV=production
 COPY worker worker
 USER pwuser
 EXPOSE 3002
