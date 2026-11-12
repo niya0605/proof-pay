@@ -12,7 +12,6 @@
     "seed": "npm -w api run seed",
     "demo": "npm run seed && npm run dev",
     "test": "npm -w api test",
-    "test:e2e": "npm -w worker run test:e2e",
     "typecheck": "npm -w api run typecheck && npm -w worker run typecheck && npm -w web run typecheck"
   },
   "devDependencies": {

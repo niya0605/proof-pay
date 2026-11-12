@@ -19,8 +19,7 @@ data/
 *.db-wal
 *.db-shm
 *.sqlite
-artifacts/*
-!artifacts/.gitkeep
+artifacts/
 
 # Test and debug output
 coverage/

@@ -54,7 +54,6 @@ Root scripts:
   demo        seed, then dev.
   test        Runs the api's vitest suite.
   typecheck   Type-checks api, worker and web.
-  test:e2e    Runs worker test/demoSites.e2e.ts. THAT FILE DOES NOT EXIST (see section 14).
 
 
 3. TECH STACK (versions from package.json)
@@ -450,8 +449,6 @@ Other:
 
 14. KNOWN GAPS AND LIMITATIONS
 -----------------------------
-- Root "npm run test:e2e" points to worker/test/demoSites.e2e.ts, which does not exist.
-  The working end-to-end script is scripts/e2e-api.mjs.
 - Reauthorization has only been tested against the fake PayPal. It needs an authorization
   older than 3 days.
 - Dockerfile.api, Dockerfile.worker and docker-compose.yml have never been built (Docker is

@@ -2,7 +2,6 @@ import { z } from "zod";
 
 /** The only five check types the brief workflow may emit. */
 export const CATALOG_TYPES = ["viewport_render", "element_present", "text_present", "form_submits", "no_console_errors"] as const;
-export type CatalogType = (typeof CATALOG_TYPES)[number];
 
 const id = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/i);
 const description = z.string().min(3).max(300);
